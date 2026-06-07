@@ -1,0 +1,28 @@
+{
+  "name": "wa-dashboard-config-management-agent",
+  "main": "src/server.ts",
+  "compatibility_date": "2026-06-07",
+  "compatibility_flags": ["nodejs_compat"],
+  "ai": {
+    "binding": "AI"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ConfigurationAgent",
+        "class_name": "ConfigurationAgent"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ConfigurationAgent"]
+    }
+  ],
+  "vars": {
+    "GITHUB_OWNER": "your-github-username-or-org",
+    "GITHUB_REPO": "your-repo-name",
+    "GITHUB_BRANCH": "main"
+  }
+}
