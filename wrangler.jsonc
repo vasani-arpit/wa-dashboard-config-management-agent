@@ -25,7 +25,9 @@
     "GITHUB_OWNER": "vasani-arpit",
     "GITHUB_REPO": "wa-dashboard-flags",
     "GITHUB_BRANCH": "master",
-    "GEMINI_API_KEY": ""
+    "GEMINI_API_KEY": "",
+    "CLOUDFLARE_ACCOUNT_ID": "",
+    "CLOUDFLARE_TOKEN": ""
   },
   "alias": {
     "node-fetch": "./fetch-polyfill"

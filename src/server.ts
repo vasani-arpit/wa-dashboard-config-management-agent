@@ -13,7 +13,9 @@ export interface Env {
     GITHUB_OWNER: string;
     GITHUB_REPO: string;
     GITHUB_BRANCH?: string;
-    GEMINI_API_KEY: string; // Optional if using direct Google API
+    GEMINI_API_KEY: string; // Optional if using direct Google API,
+    CLOUDFLARE_ACCOUNT_ID: string;
+    CLOUDFLARE_TOKEN: string;
     ConfigurationAgent: DurableObjectNamespace;
 }
 
@@ -47,9 +49,6 @@ const ALLOWED_FIELDS: Record<string, string> = {
     webhooks: "array"
 };
 
-const GEMINI_MODEL = "gemini-2.5-flash-lite";
-const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
-
 interface GeminiPart {
     text?: string;
     functionCall?: { name: string; args: Record<string, any> };
@@ -57,7 +56,7 @@ interface GeminiPart {
 }
 
 interface GeminiContent {
-    role: "user" | "model" | "function";
+    role: "user" | "model";
     parts: GeminiPart[];
 }
 
@@ -72,17 +71,21 @@ interface GeminiFunctionDeclaration {
 }
 
 async function callGemini(
-    apiKey: string,
+    accountId: string,
+    token: string,
     systemInstruction: string,
     contents: GeminiContent[],
     tools: GeminiFunctionDeclaration[]
 ): Promise<any> {
-    const url = `${GEMINI_BASE}/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+    const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run`;
 
     const body: any = {
-        system_instruction: { parts: [{ text: systemInstruction }] },
-        contents,
-        generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
+        model: "google/gemini-2.5-flash-lite",
+        input: {
+            system_instruction: { parts: [{ text: systemInstruction }] },
+            contents,
+            generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
+        },
     };
     if (tools.length > 0) {
         body.tools = [{ functionDeclarations: tools }];
@@ -90,16 +93,26 @@ async function callGemini(
 
     const res = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+            "Authorization": `Bearer ${token}`,
+            "Content-Type": "application/json",
+        },
         body: JSON.stringify(body),
     });
 
     if (!res.ok) {
         const errText = await res.text();
-        throw new Error(`Gemini API error ${res.status}: ${errText}`);
+        throw new Error(`Cloudflare AI error ${res.status}: ${errText}`);
     }
 
-    return res.json();
+    const json = await res.json() as any;
+
+    // Cloudflare wraps the Gemini response under `result`
+    if (!json.success) {
+        throw new Error(`Cloudflare AI error: ${JSON.stringify(json.errors)}`);
+    }
+
+    return json.result;
 }
 
 // Convert AIChatAgent message history → Gemini contents array
@@ -398,7 +411,7 @@ STEPS:
         const MAX_ITERATIONS = 8;
 
         for (let i = 0; i < MAX_ITERATIONS; i++) {
-            const geminiResponse = await callGemini(this.env.GEMINI_API_KEY, systemPrompt, loopContents, GEMINI_TOOLS);
+            const geminiResponse = await callGemini(this.env.CLOUDFLARE_ACCOUNT_ID, this.env.CLOUDFLARE_TOKEN, systemPrompt, loopContents, GEMINI_TOOLS);
             const candidate = geminiResponse?.candidates?.[0];
             const modelParts: GeminiPart[] = candidate?.content?.parts ?? [];
 
@@ -416,7 +429,7 @@ STEPS:
             loopContents = [
                 ...loopContents,
                 { role: "model", parts: [{ functionCall: { name, args } }] },
-                { role: "function", parts: [{ functionResponse: { name, response: toolResult } }] },
+                { role: "user", parts: [{ functionResponse: { name, response: toolResult } }] },
             ];
         }
 
