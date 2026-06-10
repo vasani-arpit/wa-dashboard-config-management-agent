@@ -1,7 +1,7 @@
 {
   "name": "wa-dashboard-config-management-agent",
   "main": "src/server.ts",
-  "compatibility_date": "2026-06-07",
+  "compatibility_date": "2025-07-18",
   "compatibility_flags": ["nodejs_compat"],
   "ai": {
     "binding": "AI"
@@ -21,8 +21,15 @@
     }
   ],
   "vars": {
-    "GITHUB_OWNER": "your-github-username-or-org",
-    "GITHUB_REPO": "your-repo-name",
-    "GITHUB_BRANCH": "main"
+    "GITHUB_TOKEN": "",
+    "GITHUB_OWNER": "vasani-arpit",
+    "GITHUB_REPO": "wa-dashboard-flags",
+    "GITHUB_BRANCH": "master",
+    "GEMINI_API_KEY": "",
+    "CLOUDFLARE_ACCOUNT_ID": "",
+    "CLOUDFLARE_TOKEN": ""
+  },
+  "alias": {
+    "node-fetch": "./fetch-polyfill"
   }
 }

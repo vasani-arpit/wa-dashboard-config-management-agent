@@ -1,10 +1,5 @@
 import { AIChatAgent } from "@cloudflare/ai-chat";
 import { routeAgentRequest, callable } from "agents";
-import { streamText, convertToCoreMessages, tool } from "ai";
-import { createWorkersAI } from "workers-ai-provider";
-import { createGoogleGenerativeAI } from "@ai-sdk/google";
-import { z } from "zod";
-
 import { GitHubService } from "./github-utils";
 import {
     updateConfigField,
@@ -18,7 +13,10 @@ export interface Env {
     GITHUB_OWNER: string;
     GITHUB_REPO: string;
     GITHUB_BRANCH?: string;
-    GEMINI_API_KEY?: string; // Optional if using direct Google API
+    GEMINI_API_KEY: string; // Optional if using direct Google API,
+    CLOUDFLARE_ACCOUNT_ID: string;
+    CLOUDFLARE_TOKEN: string;
+    ConfigurationAgent: DurableObjectNamespace;
 }
 
 interface StagedChanges {
@@ -51,6 +49,138 @@ const ALLOWED_FIELDS: Record<string, string> = {
     webhooks: "array"
 };
 
+interface GeminiPart {
+    text?: string;
+    functionCall?: { name: string; args: Record<string, any> };
+    functionResponse?: { name: string; response: Record<string, any> };
+}
+
+interface GeminiContent {
+    role: "user" | "model";
+    parts: GeminiPart[];
+}
+
+interface GeminiFunctionDeclaration {
+    name: string;
+    description: string;
+    parameters: {
+        type: "OBJECT";
+        properties: Record<string, any>;
+        required?: string[];
+    };
+}
+
+async function callGemini(
+    accountId: string,
+    token: string,
+    systemInstruction: string,
+    contents: GeminiContent[],
+    tools: GeminiFunctionDeclaration[]
+): Promise<any> {
+    const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run`;
+
+    const body: any = {
+        model: "google/gemini-2.5-flash-lite",
+        input: {
+            system_instruction: { parts: [{ text: systemInstruction }] },
+            contents,
+            generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
+        },
+    };
+    if (tools.length > 0) {
+        body.tools = [{ functionDeclarations: tools }];
+    }
+
+    const res = await fetch(url, {
+        method: "POST",
+        headers: {
+            "Authorization": `Bearer ${token}`,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Cloudflare AI error ${res.status}: ${errText}`);
+    }
+
+    const json = await res.json() as any;
+
+    // Cloudflare wraps the Gemini response under `result`
+    if (!json.success) {
+        throw new Error(`Cloudflare AI error: ${JSON.stringify(json.errors)}`);
+    }
+
+    return json.result;
+}
+
+// Convert AIChatAgent message history → Gemini contents array
+function toGeminiContents(messages: any[]): GeminiContent[] {
+    const result: GeminiContent[] = [];
+    for (const msg of messages) {
+        const role = msg.role === "assistant" ? "model" : "user";
+        const text = typeof msg.content === "string"
+            ? msg.content
+            : (msg.parts ?? []).map((p: any) => p.text ?? "").join("");
+        if (text.trim()) {
+            result.push({ role, parts: [{ text }] });
+        }
+    }
+    return result;
+}
+
+// Tool declarations for Gemini function calling
+const GEMINI_TOOLS: GeminiFunctionDeclaration[] = [
+    {
+        name: "findCustomer",
+        description: "Performs deterministic lookup using customer metadata indexes.",
+        parameters: {
+            type: "OBJECT",
+            properties: {
+                id: { type: "string", description: "The numeric customer/org ID" },
+                customerName: { type: "string", description: "Customer name from the file comment" },
+                phone: { type: "string", description: "WhatsApp phone number" },
+            },
+        },
+    },
+    {
+        name: "updateCustomerConfig",
+        description: "Parses configuration AST and stages value overrides for staging review.",
+        parameters: {
+            type: "OBJECT",
+            properties: {
+                customerId: { type: "string", description: "The org/customer ID (filename without .js)" },
+                key: { type: "string", description: `One of: ${Object.keys(ALLOWED_FIELDS).join(", ")}` },
+                value: { description: "New value. Must match the field type." },
+            },
+            required: ["customerId", "key", "value"],
+        },
+    },
+    {
+        name: "createCustomerConfig",
+        description: "Creates and templates overrides configurations for new customer accounts.",
+        parameters: {
+            type: "OBJECT",
+            properties: {
+                customerId: { type: "string", description: "The new customer/org ID" },
+            },
+            required: ["customerId"],
+        },
+    },
+    {
+        name: "commitChanges",
+        description: "Commits staged overrides to the main GitHub branch directly.",
+        parameters: {
+            type: "OBJECT",
+            properties: {
+                message: { type: "string", description: "Commit message — must start with 'support: '" },
+            },
+            required: ["message"],
+        },
+    },
+];
+
 export class ConfigurationAgent extends AIChatAgent<Env, AgentState> {
     initialState: AgentState = { pendingChanges: null };
     private customerIndex: Map<string, CustomerMeta> = new Map();
@@ -60,7 +190,7 @@ export class ConfigurationAgent extends AIChatAgent<Env, AgentState> {
             this.env.GITHUB_TOKEN,
             this.env.GITHUB_OWNER,
             this.env.GITHUB_REPO,
-            this.env.GITHUB_BRANCH || "main"
+            this.env.GITHUB_BRANCH || "master"
         );
     }
 
@@ -127,226 +257,231 @@ export class ConfigurationAgent extends AIChatAgent<Env, AgentState> {
         return null;
     }
 
-    /**
-     * Main incoming chat message loop
-     */
-    async onChatMessage(): Promise<Response> {
-        // Select model provider based on configured secrets
-        let model;
-        if (this.env.GEMINI_API_KEY) {
-            const google = createGoogleGenerativeAI({ apiKey: this.env.GEMINI_API_KEY });
-            model = google("gemini-1.5-flash");
-        } else {
-            const workersai = createWorkersAI({ binding: this.env.AI });
-            model = workersai("@cf/google/gemini-1.5-flash");
+    // ── Tool executor — runs the function the model requested ──────────────
+    private async executeTool(name: string, args: Record<string, any>): Promise<Record<string, any>> {
+        try {
+            if (name === "findCustomer") {
+                await this.ensureIndexBuilt();
+                const customer = this.findCustomerInternal(args);
+                if (!customer) {
+                    return { success: false, error: "Customer matching details was not located." };
+                }
+                return { success: true, customer };
+            }
+
+            if (name === "updateCustomerConfig") {
+                const { customerId, key, value } = args;
+                // Schema Validation
+                const expectedType = ALLOWED_FIELDS[key];
+                if (!expectedType) {
+                    return { success: false, error: `Field '${key}' does not exist inside allowed schema parameters.` };
+                }
+                const actualType = Array.isArray(value) ? "array" : typeof value;
+                if (actualType !== expectedType) {
+                    return { success: false, error: `Invalid configuration format for '${key}': Expected ${expectedType}, received ${actualType}.` };
+                }
+
+                const github = this.getGitHubService();
+                const path = `src/orgs/${customerId}.js`;
+                const file = await github.getFile(path);
+
+                let originalCode = "export default {}";
+                let isNewFile = true;
+                let oldValue: any = "(not set)";
+
+                if (file) {
+                    originalCode = file.content;
+                    isNewFile = false;
+                    try {
+                        oldValue = parseFieldValueFromCode(originalCode, key) ?? "(not set)";
+                    } catch {
+                        /* ignore */
+                    }
+                }
+
+                const updatedCode = updateConfigField(originalCode, key, value);
+
+                // Stage changes safely in Durable Object state
+                this.setState({
+                    pendingChanges: {
+                        customerId,
+                        filePath: path,
+                        key,
+                        oldValue,
+                        newValue: value,
+                        isNewFile,
+                        updatedCode,
+                        sha: file?.sha,
+                    }
+                });
+
+                return {
+                    success: true,
+                    dryRun: true,
+                    customerId,
+                    filePath: path,
+                    key,
+                    oldValue,
+                    newValue: value,
+                    isNewFile,
+                };
+            }
+            if (name === "createCustomerConfig") {
+                const { customerId } = args;
+                const github = this.getGitHubService();
+                const path = `src/orgs/${customerId}.js`;
+                const file = await github.getFile(path);
+
+                if (file) {
+                    return { success: false, error: `Override config for ${customerId} already exists.` };
+                }
+
+                const template = `// file: src/orgs/${customerId}.js\nexport default {}\n`;
+
+                this.setState({
+                    pendingChanges: {
+                        customerId,
+                        filePath: path,
+                        key: "creation",
+                        oldValue: null,
+                        newValue: "export default {}",
+                        isNewFile: true,
+                        updatedCode: template
+                    }
+                });
+
+                return {
+                    success: true,
+                    dryRun: true,
+                    customerId,
+                    filePath: path,
+                    isNewFile: true,
+                };
+            }
+
+            if (name === "commitChanges") {
+                const staged = this.state.pendingChanges;
+                if (!staged) {
+                    return { success: false, error: "No changes staged. Perform updates first." };
+                }
+                const github = this.getGitHubService();
+                await github.updateFile(
+                    staged.filePath,
+                    staged.updatedCode,
+                    args.message,
+                    staged.sha
+                );
+
+                // Clear local changes
+                this.setState({ pendingChanges: null });
+
+                // Rebuild Index dynamically
+                this.customerIndex.clear();
+
+                return {
+                    success: true,
+                    message: "Successfully committed customer configurations to branch.",
+                    commitMessage: args.message,
+                    filePath: staged.filePath
+                };
+            }
+
+            return { success: false, error: `Unknown tool: ${name}` };
+        } catch (err: any) {
+            return { success: false, error: err.message };
         }
+    }
 
+    private async runAgentLoop(contents: GeminiContent[]): Promise<string> {
         const systemPrompt = `You are a support configuration agent.
-
 You may only create customer configuration override files and update schema values inside these files.
 You may NEVER modify application code or files outside 'src/orgs/'.
 If a request demands code changes, gracefully reject the execution and explain that developers must perform the change manually.
-
 ALLOWED_FIELDS SCHEMA:
 ${JSON.stringify(ALLOWED_FIELDS, null, 2)}
-
 Strictly reject edits on unlisted schema fields (prevent schema expansions).
-
 STEPS:
-1. Always deterministic-lookup the customer index using 'findCustomer'. 
+1. Always deterministic-lookup the customer index using 'findCustomer'.
 2. Call 'updateCustomerConfig' or 'createCustomerConfig' to stage change parameters.
 3. Your staging operation acts as a DRY RUN. Ask support staff: "Proceed with commit? (Reply with 'Confirm')"
-4. Upon explicit user confirmation (e.g. "Confirm" / "Proceed"), run the 'commitChanges' tool with a clear descriptive message in 'support: [message]' structure.`;
+4. Upon explicit user confirmation (e.g. "Confirm" / "yes"), run the 'commitChanges' tool with a clear descriptive message in 'support: [message]' structure.`;
 
-        const result = streamText({
-            model,
-            system: systemPrompt,
-            messages: await convertToModelMessages(this.messages),
-            tools: {
-                findCustomer: tool({
-                    description: "Performs deterministic lookup using customer metadata indexes.",
-                    parameters: z.object({
-                        id: z.string().optional(),
-                        customerName: z.string().optional(),
-                        phone: z.string().optional(),
-                    }),
-                    execute: async (query) => {
-                        await this.ensureIndexBuilt();
-                        const customer = this.findCustomerInternal(query);
-                        if (!customer) {
-                            return { success: false, error: "Customer matching details was not located." };
-                        }
-                        return { success: true, customer };
-                    }
-                }),
+        let loopContents = [...contents];
+        let finalText = "";
+        const MAX_ITERATIONS = 8;
 
-                updateCustomerConfig: tool({
-                    description: "Parses configuration AST and stages value overrides for staging review.",
-                    parameters: z.object({
-                        customerId: z.string(),
-                        key: z.string(),
-                        value: z.any(),
-                    }),
-                    execute: async ({ customerId, key, value }) => {
-                        try {
-                            // Schema Validation
-                            const expectedType = ALLOWED_FIELDS[key];
-                            if (!expectedType) {
-                                return { success: false, error: `Field '${key}' does not exist inside allowed schema parameters.` };
-                            }
-                            const actualType = Array.isArray(value) ? "array" : typeof value;
-                            if (actualType !== expectedType) {
-                                return { success: false, error: `Invalid configuration format for '${key}': Expected ${expectedType}, received ${actualType}.` };
-                            }
+        for (let i = 0; i < MAX_ITERATIONS; i++) {
+            const geminiResponse = await callGemini(this.env.CLOUDFLARE_ACCOUNT_ID, this.env.CLOUDFLARE_TOKEN, systemPrompt, loopContents, GEMINI_TOOLS);
+            const candidate = geminiResponse?.candidates?.[0];
+            const modelParts: GeminiPart[] = candidate?.content?.parts ?? [];
 
-                            const github = this.getGitHubService();
-                            const path = `src/orgs/${customerId}.js`;
-                            const file = await github.getFile(path);
+            const funcCall = modelParts.find((p: GeminiPart) => p.functionCall);
+            if (!funcCall?.functionCall) {
+                finalText = modelParts.map((p: GeminiPart) => p.text ?? "").join("");
+                break;
+            }
 
-                            let originalCode = "export default {}";
-                            let isNewFile = true;
-                            let oldValue: any = "(not set)";
+            const { name, args } = funcCall.functionCall;
+            console.log(`[agent] tool call: ${name}`, args);
+            const toolResult = await this.executeTool(name, args);
+            console.log(`[agent] tool result:`, toolResult);
 
-                            if (file) {
-                                originalCode = file.content;
-                                isNewFile = false;
-                                try {
-                                    oldValue = parseFieldValueFromCode(originalCode, key) ?? "(not set)";
-                                } catch {
-                                    oldValue = "(not set)";
-                                }
-                            }
+            loopContents = [
+                ...loopContents,
+                { role: "model", parts: [{ functionCall: { name, args } }] },
+                { role: "user", parts: [{ functionResponse: { name, response: toolResult } }] },
+            ];
+        }
 
-                            const updatedCode = updateConfigField(originalCode, key, value);
+        return finalText || "Done. Let me know if you need anything else.";
+    }
 
-                            // Stage changes safely in Durable Object state
-                            this.setState({
-                                pendingChanges: {
-                                    customerId,
-                                    filePath: path,
-                                    key,
-                                    oldValue,
-                                    newValue: value,
-                                    isNewFile,
-                                    updatedCode,
-                                    sha: file?.sha,
-                                }
-                            });
+    // ── onChatMessage — handles chat UI (browser) requests ─────────────────
+    async onChatMessage(): Promise<Response> {
+        const contents = toGeminiContents(this.messages);
+        const finalText = await this.runAgentLoop(contents);
 
-                            return {
-                                success: true,
-                                dryRun: true,
-                                customerId,
-                                filePath: path,
-                                key,
-                                oldValue,
-                                newValue: value,
-                                isNewFile,
-                            };
-                        } catch (error: any) {
-                            return { success: false, error: error.message };
-                        }
-                    }
-                }),
-
-                createCustomerConfig: tool({
-                    description: "Creates and templates overrides configurations for new customer accounts.",
-                    parameters: z.object({
-                        customerId: z.string(),
-                    }),
-                    execute: async ({ customerId }) => {
-                        try {
-                            const github = this.getGitHubService();
-                            const path = `src/orgs/${customerId}.js`;
-                            const file = await github.getFile(path);
-
-                            if (file) {
-                                return { success: false, error: `Override config for ${customerId} already exists.` };
-                            }
-
-                            const template = `// file: src/orgs/${customerId}.js\nexport default {}\n`;
-
-                            this.setState({
-                                pendingChanges: {
-                                    customerId,
-                                    filePath: path,
-                                    key: "creation",
-                                    oldValue: null,
-                                    newValue: "export default {}",
-                                    isNewFile: true,
-                                    updatedCode: template,
-                                }
-                            });
-
-                            return {
-                                success: true,
-                                dryRun: true,
-                                customerId,
-                                filePath: path,
-                                isNewFile: true,
-                            };
-                        } catch (error: any) {
-                            return { success: false, error: error.message };
-                        }
-                    }
-                }),
-
-                commitChanges: tool({
-                    description: "Commits staged overrides to the main GitHub branch directly.",
-                    parameters: z.object({
-                        message: z.string().describe("Commit descriptions structural prefix standard: support: <action>"),
-                    }),
-                    execute: async ({ message }) => {
-                        const staged = this.state.pendingChanges;
-                        if (!staged) {
-                            return { success: false, error: "No changes staged. Perform updates first." };
-                        }
-
-                        try {
-                            const github = this.getGitHubService();
-                            await github.updateFile(
-                                staged.filePath,
-                                staged.updatedCode,
-                                message,
-                                staged.sha
-                            );
-
-                            // Clear local changes
-                            this.setState({ pendingChanges: null });
-
-                            // Rebuild Index dynamically
-                            this.customerIndex.clear();
-
-                            return {
-                                success: true,
-                                message: "Successfully committed customer configurations to branch.",
-                                commitMessage: message,
-                                filePath: staged.filePath
-                            };
-                        } catch (error: any) {
-                            return { success: false, error: error.message };
-                        }
-                    }
-                })
+        // Return in Vercel AI data stream format expected by AIChatAgent UI
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream({
+            start(controller) {
+                controller.enqueue(encoder.encode(`0:${JSON.stringify(finalText)}\n`));
+                controller.close();
             }
         });
 
-        return result.toUIMessageStreamResponse();
+        return new Response(stream, {
+            headers: {
+                "Content-Type": "text/event-stream",
+                "x-vercel-ai-data-stream": "v1",
+            }
+        });
     }
 
-    /**
-     * Programmatic Trigger Endpoint API Execution
-     */
+    // ── triggerProgrammatically — called via /api/trigger or service binding
+    // Runs the full agentic loop and returns the text reply directly.
     @callable()
-    async triggerProgrammatically(prompt: string): Promise<{ success: boolean; result: any }> {
-        const run = await this.saveMessages([
-            {
-                id: crypto.randomUUID(),
-                role: "user",
-                parts: [{ type: "text", text: prompt }],
-            }
-        ]);
-        return { success: true, result: run };
+    async triggerProgrammatically(prompt: string): Promise<{ success: boolean; reply: string }> {
+        // Short-circuit: if user just confirms a pending change, commit directly
+        const normalized = prompt.trim().toLowerCase();
+        if (this.state.pendingChanges && ["yes", "confirm", "y"].includes(normalized)) {
+            const result = await this.executeTool("commitChanges", {
+                message: `support: update ${this.state.pendingChanges.key} for ${this.state.pendingChanges.customerId}`
+            });
+            return { success: result.success, reply: result.success ? `Changes committed successfully.` : result.error };
+        }
+
+        // Normal flow: build history + run agent loop
+        const history = toGeminiContents(this.messages ?? []);
+        const contents: GeminiContent[] = [
+            ...history,
+            { role: "user", parts: [{ text: prompt }] }
+        ];
+
+        // Run agent loop — calls Gemini + executes tools until text reply
+        const reply = await this.runAgentLoop(contents);
+
+        return { success: true, reply };
     }
 }
 
@@ -360,6 +495,10 @@ export default {
 
         // Direct HTTP API trigger integration (POST /api/trigger)
         const url = new URL(request.url);
+
+        // POST /api/trigger
+        // Body: { "prompt": "set saveMedia to true for customer 123"}
+        // Returns: { "success": true, "reply": "..." }
         if (request.method === "POST" && url.pathname === "/api/trigger") {
             try {
                 const { prompt } = (await request.json()) as { prompt: string };
