@@ -455,7 +455,7 @@ STEPS:
             const result = await this.executeTool("commitChanges", {
                 message: `support: update ${this.state.pendingChanges.key} for ${this.state.pendingChanges.customerId}`
             });
-            return { success: result.success, reply: result.success ? `Changes committed successfully. ✓` : result.error };
+            return { success: result.success, reply: result.success ? `Changes committed successfully.` : result.error };
         }
 
         // Normal flow: build history + run agent loop
