@@ -85,11 +85,9 @@ async function callGemini(
             system_instruction: { parts: [{ text: systemInstruction }] },
             contents,
             generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
+            ...(tools.length > 0 && { tools: [{ functionDeclarations: tools }] }),
         },
     };
-    if (tools.length > 0) {
-        body.tools = [{ functionDeclarations: tools }];
-    }
 
     const res = await fetch(url, {
         method: "POST",
@@ -394,6 +392,8 @@ export class ConfigurationAgent extends AIChatAgent<Env, AgentState> {
 
     private async runAgentLoop(contents: GeminiContent[]): Promise<string> {
         const systemPrompt = `You are a support configuration agent.
+IMPORTANT: Never ask clarifying questions. All information needed is in the user's message.
+If a customer ID, name, or phone is provided, call findCustomer immediately with that information.
 You may only create customer configuration override files and update schema values inside these files.
 You may NEVER modify application code or files outside 'src/orgs/'.
 If a request demands code changes, gracefully reject the execution and explain that developers must perform the change manually.
@@ -403,6 +403,7 @@ Strictly reject edits on unlisted schema fields (prevent schema expansions).
 STEPS:
 1. Always deterministic-lookup the customer index using 'findCustomer'.
 2. Call 'updateCustomerConfig' or 'createCustomerConfig' to stage change parameters.
+   CRITICAL: Pass the EXACT value from the user's request. If user says "set X to false", pass boolean false. If user says "set X to true", pass boolean true. Never infer or substitute the value.
 3. Your staging operation acts as a DRY RUN. Ask support staff: "Proceed with commit? (Reply with 'Confirm')"
 4. Upon explicit user confirmation (e.g. "Confirm" / "yes"), run the 'commitChanges' tool with a clear descriptive message in 'support: [message]' structure.`;
 
