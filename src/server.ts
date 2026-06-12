@@ -297,6 +297,15 @@ export class ConfigurationAgent extends AIChatAgent<Env, AgentState> {
                     }
                 }
 
+                // Skip if existing values to prevent unnecessary updates
+                if (!isNewFile && oldValue === value) {
+                    return {
+                        success: true,
+                        noChange: true,
+                        message: `'${key}' for customer ${customerId} is already set to ${JSON.stringify(value)}. No update required.`
+                    };
+                }
+
                 const updatedCode = updateConfigField(originalCode, key, value);
 
                 // Stage changes safely in Durable Object state
@@ -404,6 +413,7 @@ STEPS:
 1. Always deterministic-lookup the customer index using 'findCustomer'.
 2. Call 'updateCustomerConfig' or 'createCustomerConfig' to stage change parameters.
    CRITICAL: Pass the EXACT value from the user's request. If user says "set X to false", pass boolean false. If user says "set X to true", pass boolean true. Never infer or substitute the value.
+   If the tool returns noChange: true, reply with only the message from the tool result and STOP. Do not ask for confirmation.
 3. Your staging operation acts as a DRY RUN. Ask support staff: "Proceed with commit? (Reply with 'Confirm')"
 4. Upon explicit user confirmation (e.g. "Confirm" / "yes"), run the 'commitChanges' tool with a clear descriptive message in 'support: [message]' structure.`;
 
