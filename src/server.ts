@@ -259,6 +259,9 @@ export class ConfigurationAgent extends AIChatAgent<Env, AgentState> {
     private async executeTool(name: string, args: Record<string, any>): Promise<Record<string, any>> {
         try {
             if (name === "findCustomer") {
+                if (args.id === "default") {
+                    return { success: true, customer: { customerId: "default", customerName: null, phone: null, path: "src/orgs/default.js" } };
+                }
                 await this.ensureIndexBuilt();
                 const customer = this.findCustomerInternal(args);
                 if (!customer) {
@@ -403,6 +406,7 @@ export class ConfigurationAgent extends AIChatAgent<Env, AgentState> {
         const systemPrompt = `You are a support configuration agent.
 IMPORTANT: Never ask clarifying questions. All information needed is in the user's message.
 If a customer ID, name, or phone is provided, call findCustomer immediately with that information.
+If the user refers to 'default.js' or 'default config' or 'default file', call findCustomer with id: "default".
 You may only create customer configuration override files and update schema values inside these files.
 You may NEVER modify application code or files outside 'src/orgs/'.
 If a request demands code changes, gracefully reject the execution and explain that developers must perform the change manually.
