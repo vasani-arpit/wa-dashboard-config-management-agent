@@ -150,7 +150,7 @@ const GEMINI_TOOLS: GeminiFunctionDeclaration[] = [
             properties: {
                 customerId: { type: "string", description: "The org/customer ID (filename without .js)" },
                 key: { type: "string", description: `One of: ${Object.keys(ALLOWED_FIELDS).join(", ")}` },
-                value: { description: "New value. Must match the field type." },
+                value: { description: "New value. Must match the field type. Can be null for nullable fields like telegramChatId." },
             },
             required: ["customerId", "key", "value"],
         },
@@ -259,6 +259,9 @@ export class ConfigurationAgent extends AIChatAgent<Env, AgentState> {
     private async executeTool(name: string, args: Record<string, any>): Promise<Record<string, any>> {
         try {
             if (name === "findCustomer") {
+                if (args.id === "default") {
+                    return { success: true, customer: { customerId: "default", customerName: null, phone: null, path: "src/orgs/default.js" } };
+                }
                 await this.ensureIndexBuilt();
                 const customer = this.findCustomerInternal(args);
                 if (!customer) {
@@ -275,7 +278,8 @@ export class ConfigurationAgent extends AIChatAgent<Env, AgentState> {
                     return { success: false, error: `Field '${key}' does not exist inside allowed schema parameters.` };
                 }
                 const actualType = Array.isArray(value) ? "array" : typeof value;
-                if (actualType !== expectedType) {
+                const isNullableField = expectedType === "string" && value === null;
+                if (!isNullableField && actualType !== expectedType) {
                     return { success: false, error: `Invalid configuration format for '${key}': Expected ${expectedType}, received ${actualType}.` };
                 }
 
@@ -403,6 +407,7 @@ export class ConfigurationAgent extends AIChatAgent<Env, AgentState> {
         const systemPrompt = `You are a support configuration agent.
 IMPORTANT: Never ask clarifying questions. All information needed is in the user's message.
 If a customer ID, name, or phone is provided, call findCustomer immediately with that information.
+If the user refers to 'default.js' or 'default config' or 'default file', call findCustomer with id: "default".
 You may only create customer configuration override files and update schema values inside these files.
 You may NEVER modify application code or files outside 'src/orgs/'.
 If a request demands code changes, gracefully reject the execution and explain that developers must perform the change manually.
@@ -412,7 +417,7 @@ Strictly reject edits on unlisted schema fields (prevent schema expansions).
 STEPS:
 1. Always deterministic-lookup the customer index using 'findCustomer'.
 2. Call 'updateCustomerConfig' or 'createCustomerConfig' to stage change parameters.
-   CRITICAL: Pass the EXACT value from the user's request. If user says "set X to false", pass boolean false. If user says "set X to true", pass boolean true. Never infer or substitute the value.
+   CRITICAL: Pass the EXACT value from the user's request. If user says "set X to false", pass boolean false. If user says "set X to true", pass boolean true. If user says "set X to null", pass null. Never infer or substitute the value.
    If the tool returns noChange: true, reply with only the message from the tool result and STOP. Do not ask for confirmation.
 3. Your staging operation acts as a DRY RUN. Ask support staff: "Proceed with commit? (Reply with 'Confirm')"
 4. Upon explicit user confirmation (e.g. "Confirm" / "yes"), run the 'commitChanges' tool with a clear descriptive message in 'support: [message]' structure.`;
